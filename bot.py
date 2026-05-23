@@ -26,6 +26,7 @@ PG        = 5
 
 # Conversation states
 ASK_AMOUNT, ASK_DESC, ASK_PARTIAL = range(3)
+ADM_SEL_LENDER, ADM_ASK_DATE, ADM_ASK_AMT, ADM_ASK_DESC = range(3, 7)
 
 
 # ── DB ────────────────────────────────────────────────────────────────────────
@@ -553,6 +554,36 @@ def build_top(tab):
     return "\n".join(lines), Kbd(btns)
 
 
+def build_adm_sel_user(exclude_uid, page, cb_prefix, nav_prefix, title, subtitle):
+    """Paginated user list for admin debt creation."""
+    with get_db() as c:
+        all_u = c.execute(
+            "SELECT * FROM users WHERE user_id != ? ORDER BY first_name", (exclude_uid,)
+        ).fetchall()
+
+    if not all_u:
+        return (
+            f"{title}\n\n❌ Нет других пользователей.",
+            Kbd([[Btn("◀️ Отмена", callback_data="adm_conv_cancel")]])
+        )
+
+    chunk, page, pages = paginate(list(all_u), page, 6)
+    lines = [title, "━━━━━━━━━━━━━━━━━━━━", subtitle, ""]
+    btns  = []
+
+    for u in chunk:
+        rat = calc_rating(u["user_id"])
+        raw = display(u)
+        lines.append(f"• <b>{e(raw)}</b>  {stars(rat)} {rat}")
+        btns.append([Btn(f"👤 {raw[:28]}", callback_data=f"{cb_prefix}:{u['user_id']}")])
+
+    nav = nav_row(page, pages, nav_prefix)
+    if nav:
+        btns.append(nav)
+    btns.append([Btn("❌ Отмена", callback_data="adm_conv_cancel")])
+    return "\n".join(lines), Kbd(btns)
+
+
 def build_admin():
     with get_db() as c:
         g = c.execute("""
@@ -575,6 +606,7 @@ def build_admin():
     return text, Kbd([
         [Btn("👥 Пользователи",   callback_data="adm_u:0"),
          Btn("📋 Активные долги", callback_data="adm_d:0")],
+        [Btn("➕ Начислить долг", callback_data="adm_newdebt")],
         [Btn("◀️ Меню", callback_data="menu")],
     ])
 
@@ -1486,6 +1518,275 @@ async def cb_preject(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         pass
 
 
+# ── ADMIN DEBT CREATION CONVERSATION ─────────────────────────────────────────
+
+async def cb_adm_newdebt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Admin clicks '➕ Начислить долг' — show borrower selection."""
+    q = update.callback_query
+    if q.from_user.id not in ADMIN_IDS:
+        await q.answer("❌ Нет прав.", show_alert=True); return
+    await q.answer()
+    ctx.user_data["adm_cid"] = q.message.chat_id
+    ctx.user_data["adm_mid"] = q.message.message_id
+    await edit_msg(q, *build_adm_sel_user(
+        exclude_uid=-1, page=0,
+        cb_prefix="adm_sel_b", nav_prefix="adm_usel_b",
+        title="➕ <b>Начислить долг</b>",
+        subtitle="Шаг 1/5 — Выбери <b>должника</b>:",
+    ))
+
+
+async def cb_adm_usel_b(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Paginate borrower selection (before conversation starts)."""
+    q = update.callback_query
+    if q.from_user.id not in ADMIN_IDS:
+        await q.answer(); return
+    await q.answer()
+    page = int(q.data.split(":")[1])
+    await edit_msg(q, *build_adm_sel_user(
+        exclude_uid=-1, page=page,
+        cb_prefix="adm_sel_b", nav_prefix="adm_usel_b",
+        title="➕ <b>Начислить долг</b>",
+        subtitle="Шаг 1/5 — Выбери <b>должника</b>:",
+    ))
+
+
+async def cb_adm_sel_b(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Borrower selected — store and show lender selection. Conv entry point."""
+    q   = update.callback_query
+    uid = q.from_user.id
+    if uid not in ADMIN_IDS:
+        await q.answer("❌ Нет прав.", show_alert=True); return
+
+    borrower_uid = int(q.data.split(":")[1])
+    borrower     = get_user(borrower_uid)
+    if not borrower:
+        await q.answer("❌ Пользователь не найден.", show_alert=True); return
+
+    ctx.user_data["adm_borrower_uid"]  = borrower_uid
+    ctx.user_data["adm_borrower_name"] = display(borrower)
+    ctx.user_data["adm_cid"] = q.message.chat_id
+    ctx.user_data["adm_mid"] = q.message.message_id
+    await q.answer()
+    await edit_msg(q, *build_adm_sel_user(
+        exclude_uid=borrower_uid, page=0,
+        cb_prefix="adm_sel_l", nav_prefix="adm_usel_l",
+        title="➕ <b>Начислить долг</b>\n"
+              f"✅ Должник: <b>{e(display(borrower))}</b>",
+        subtitle="Шаг 2/5 — Выбери <b>кредитора</b> (кто дал деньги):",
+    ))
+    return ADM_SEL_LENDER
+
+
+async def conv_adm_usel_l(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Paginate lender selection inside conversation."""
+    q = update.callback_query
+    await q.answer()
+    page         = int(q.data.split(":")[1])
+    borrower_uid = ctx.user_data.get("adm_borrower_uid", -1)
+    bname        = ctx.user_data.get("adm_borrower_name", "")
+    await edit_msg(q, *build_adm_sel_user(
+        exclude_uid=borrower_uid, page=page,
+        cb_prefix="adm_sel_l", nav_prefix="adm_usel_l",
+        title=f"➕ <b>Начислить долг</b>\n✅ Должник: <b>{e(bname)}</b>",
+        subtitle="Шаг 2/5 — Выбери <b>кредитора</b>:",
+    ))
+    return ADM_SEL_LENDER
+
+
+async def conv_adm_sel_l(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Lender selected inside conversation — ask for date."""
+    q          = update.callback_query
+    lender_uid = int(q.data.split(":")[1])
+    lender     = get_user(lender_uid)
+    if not lender:
+        await q.answer("❌ Не найден.", show_alert=True)
+        return ADM_SEL_LENDER
+
+    ctx.user_data["adm_lender_uid"]  = lender_uid
+    ctx.user_data["adm_lender_name"] = display(lender)
+    bname = ctx.user_data.get("adm_borrower_name", "")
+    lname = display(lender)
+    await q.answer()
+    await edit_msg(q,
+        f"➕ <b>Начислить долг</b>\n"
+        f"✅ Должник:  <b>{e(bname)}</b>\n"
+        f"✅ Кредитор: <b>{e(lname)}</b>\n\n"
+        "Шаг 3/5 — Введи <b>дату</b> долга (например: <code>2024-03-15</code> или <code>15.03.2024</code>):",
+        Kbd([[Btn("❌ Отмена", callback_data="adm_conv_cancel")]]),
+    )
+    return ADM_ASK_DATE
+
+
+async def conv_adm_get_date(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+
+    raw = update.message.text.strip()
+    # Accept formats: YYYY-MM-DD, DD.MM.YYYY, DD/MM/YYYY
+    import re
+    date_str = None
+    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})$", raw)
+    if m:
+        date_str = raw
+    m2 = re.match(r"^(\d{1,2})[./](\d{1,2})[./](\d{4})$", raw)
+    if m2:
+        date_str = f"{m2.group(3)}-{int(m2.group(2)):02d}-{int(m2.group(1)):02d}"
+
+    bname = ctx.user_data.get("adm_borrower_name", "")
+    lname = ctx.user_data.get("adm_lender_name", "")
+
+    if not date_str:
+        await _adm_edit(ctx,
+            f"➕ <b>Начислить долг</b>\n"
+            f"✅ Должник: <b>{e(bname)}</b>  Кредитор: <b>{e(lname)}</b>\n\n"
+            "❌ Неверный формат. Введи дату: <code>2024-03-15</code> или <code>15.03.2024</code>:",
+            Kbd([[Btn("❌ Отмена", callback_data="adm_conv_cancel")]]))
+        return ADM_ASK_DATE
+
+    ctx.user_data["adm_date"] = date_str
+    await _adm_edit(ctx,
+        f"➕ <b>Начислить долг</b>\n"
+        f"✅ Должник: <b>{e(bname)}</b>\n"
+        f"✅ Кредитор: <b>{e(lname)}</b>\n"
+        f"✅ Дата: <b>{date_str}</b>\n\n"
+        "Шаг 4/5 — Введи <b>сумму</b> долга (₸):",
+        Kbd([[Btn("❌ Отмена", callback_data="adm_conv_cancel")]]))
+    return ADM_ASK_AMT
+
+
+async def conv_adm_get_amt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+
+    raw = update.message.text.strip().replace(",", ".").replace(" ", "")
+    bname = ctx.user_data.get("adm_borrower_name", "")
+    lname = ctx.user_data.get("adm_lender_name", "")
+    date  = ctx.user_data.get("adm_date", "")
+
+    try:
+        amount = float(raw)
+        if amount <= 0:
+            raise ValueError
+    except ValueError:
+        await _adm_edit(ctx,
+            f"➕ <b>Начислить долг</b>\n"
+            f"✅ Должник: <b>{e(bname)}</b>  Кредитор: <b>{e(lname)}</b>\n"
+            f"✅ Дата: <b>{date}</b>\n\n"
+            "❌ Неверная сумма. Введи число (например: <code>50000</code>):",
+            Kbd([[Btn("❌ Отмена", callback_data="adm_conv_cancel")]]))
+        return ADM_ASK_AMT
+
+    ctx.user_data["adm_amt"] = amount
+    await _adm_edit(ctx,
+        f"➕ <b>Начислить долг</b>\n"
+        f"✅ Должник: <b>{e(bname)}</b>\n"
+        f"✅ Кредитор: <b>{e(lname)}</b>\n"
+        f"✅ Дата: <b>{date}</b>\n"
+        f"✅ Сумма: <b>{tg(amount)}</b>\n\n"
+        "Шаг 5/5 — Введи <b>описание</b> или нажми «Пропустить»:",
+        Kbd([[Btn("⏩ Пропустить", callback_data="adm_conv_skip"),
+              Btn("❌ Отмена",     callback_data="adm_conv_cancel")]]))
+    return ADM_ASK_DESC
+
+
+async def conv_adm_skip_desc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    ctx.user_data["adm_desc"] = "Без описания"
+    return await _adm_finalize(q.from_user.id, ctx, q=q)
+
+
+async def conv_adm_get_desc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+    ctx.user_data["adm_desc"] = update.message.text.strip()[:200]
+    return await _adm_finalize(update.effective_user.id, ctx)
+
+
+async def conv_adm_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer("❌ Отменено.")
+    ctx.user_data.clear()
+    await edit_msg(q, *build_admin())
+    return ConversationHandler.END
+
+
+async def _adm_edit(ctx, text, kb):
+    try:
+        await ctx.bot.edit_message_text(
+            chat_id=ctx.user_data["adm_cid"], message_id=ctx.user_data["adm_mid"],
+            text=text, parse_mode="HTML", reply_markup=kb,
+        )
+    except Exception:
+        pass
+
+
+async def _adm_finalize(admin_uid, ctx, q=None):
+    borrower_uid = ctx.user_data["adm_borrower_uid"]
+    lender_uid   = ctx.user_data["adm_lender_uid"]
+    bname        = ctx.user_data["adm_borrower_name"]
+    lname        = ctx.user_data["adm_lender_name"]
+    date         = ctx.user_data["adm_date"]
+    amount       = ctx.user_data["adm_amt"]
+    desc         = ctx.user_data.get("adm_desc", "Без описания")
+
+    with get_db() as c:
+        cur = c.execute("""
+            INSERT INTO debts(borrower_id, lender_id, amount, description,
+                              status, initiated_by, created_at, confirmed_at)
+            VALUES (?, ?, ?, ?, 'active', 'admin', ?, ?)
+        """, (borrower_uid, lender_uid, amount, desc, date + " 00:00:00", date + " 00:00:00"))
+        did = cur.lastrowid
+
+    refresh_rating(borrower_uid)
+
+    result = (
+        f"✅ <b>Долг начислен администратором!</b>\n"
+        f"🆔 #{did}\n"
+        f"👤 Должник: <b>{e(bname)}</b>\n"
+        f"👤 Кредитор: <b>{e(lname)}</b>\n"
+        f"📅 Дата: <b>{date}</b>\n"
+        f"💵 Сумма: <b>{tg(amount)}</b>\n"
+        f"📝 {e(desc)}"
+    )
+    result_kb = Kbd([[Btn("⚙️ Админ-панель", callback_data="admin")]])
+
+    # Notify both parties
+    for uid, role in [(borrower_uid, "должник"), (lender_uid, "кредитор")]:
+        try:
+            other = lname if uid == borrower_uid else bname
+            await ctx.bot.send_message(
+                uid,
+                f"🔧 <b>Администратор начислил долг #{did}</b>\n"
+                f"👤 {'Кредитор' if uid == borrower_uid else 'Должник'}: <b>{e(other)}</b>\n"
+                f"📅 Дата: <b>{date}</b>\n"
+                f"💵 <b>{tg(amount)}</b>\n"
+                f"📝 {e(desc)}",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+    try:
+        await ctx.bot.edit_message_text(
+            chat_id=ctx.user_data["adm_cid"], message_id=ctx.user_data["adm_mid"],
+            text=result, parse_mode="HTML", reply_markup=result_kb,
+        )
+    except Exception:
+        if q:
+            await edit_msg(q, result, result_kb)
+
+    ctx.user_data.clear()
+    return ConversationHandler.END
+
+
 # ── ADMIN ACTION CALLBACKS ────────────────────────────────────────────────────
 
 async def cb_adm_clear(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1573,8 +1874,37 @@ def main():
         allow_reentry=True,
     )
 
+    # Conversation: admin manual debt creation
+    conv_admin = ConversationHandler(
+        entry_points=[CallbackQueryHandler(cb_adm_sel_b, pattern=r"^adm_sel_b:\d+$")],
+        states={
+            ADM_SEL_LENDER: [
+                CallbackQueryHandler(conv_adm_sel_l,  pattern=r"^adm_sel_l:\d+$"),
+                CallbackQueryHandler(conv_adm_usel_l, pattern=r"^adm_usel_l:\d+$"),
+                CallbackQueryHandler(conv_adm_cancel, pattern=r"^adm_conv_cancel$"),
+            ],
+            ADM_ASK_DATE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, conv_adm_get_date),
+                CallbackQueryHandler(conv_adm_cancel, pattern=r"^adm_conv_cancel$"),
+            ],
+            ADM_ASK_AMT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, conv_adm_get_amt),
+                CallbackQueryHandler(conv_adm_cancel, pattern=r"^adm_conv_cancel$"),
+            ],
+            ADM_ASK_DESC: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, conv_adm_get_desc),
+                CallbackQueryHandler(conv_adm_skip_desc, pattern=r"^adm_conv_skip$"),
+                CallbackQueryHandler(conv_adm_cancel,    pattern=r"^adm_conv_cancel$"),
+            ],
+        },
+        fallbacks=[CallbackQueryHandler(conv_adm_cancel, pattern=r"^adm_conv_cancel$")],
+        per_message=False,
+        allow_reentry=True,
+    )
+
     app.add_handler(conv_debt)
     app.add_handler(conv_partial)
+    app.add_handler(conv_admin)
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("menu",  cmd_menu))
@@ -1610,6 +1940,8 @@ def main():
         (r"^preject:\d+$",            cb_preject),
         (r"^adm_cl:\d+$",             cb_adm_clear),
         (r"^adm_rm:\d+$",             cb_adm_remove),
+        (r"^adm_newdebt$",            cb_adm_newdebt),
+        (r"^adm_usel_b:\d+$",         cb_adm_usel_b),
         (r"^noop$",                   cb_noop),
     ]:
         app.add_handler(CallbackQueryHandler(handler, pattern=pattern))
